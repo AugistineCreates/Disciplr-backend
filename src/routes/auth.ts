@@ -4,6 +4,7 @@ import { registerSchema, loginSchema, refreshSchema } from '../lib/validation.js
 import { createAuditLog } from '../lib/audit-logs.js'
 import { authenticate } from '../middleware/auth.js'
 import { revokeSession, revokeAllUserSessions } from '../services/session.js'
+import { requireJson } from '../middleware/requireJson.js'
 
 export const authRouter = Router()
 
@@ -38,7 +39,7 @@ const upsertMockUser = (userId: string): MockUser => {
 
 // ------------- Endpoints -------------
 
-authRouter.post('/register', async (req, res) => {
+authRouter.post('/register', requireJson, async (req, res) => {
     const result = registerSchema.safeParse(req.body)
     if (!result.success) {
         res.status(400).json({ error: result.error.format() })
@@ -53,7 +54,7 @@ authRouter.post('/register', async (req, res) => {
     }
 })
 
-authRouter.post('/login', async (req, res) => {
+authRouter.post('/login', requireJson, async (req, res) => {
     // Support mock login if only userId is provided (from audit-logs feature branch)
     if (req.body.userId && !req.body.email && !req.body.password) {
         const { userId } = req.body as { userId: string }
@@ -96,7 +97,7 @@ authRouter.post('/login', async (req, res) => {
     }
 })
 
-authRouter.post('/refresh', async (req, res) => {
+authRouter.post('/refresh', requireJson, async (req, res) => {
     const result = refreshSchema.safeParse(req.body)
     if (!result.success) {
         res.status(400).json({ error: result.error.format() })
@@ -111,7 +112,7 @@ authRouter.post('/refresh', async (req, res) => {
     }
 })
 
-authRouter.post('/logout', authenticate, async (req: Request, res: Response) => {
+authRouter.post('/logout', authenticate, requireJson, async (req: Request, res: Response) => {
     // 1. AuthService refresh token logout
     const { refreshToken } = req.body
     if (refreshToken) {
@@ -131,7 +132,7 @@ authRouter.post('/logout', authenticate, async (req: Request, res: Response) => 
     res.json({ message: 'Successfully logged out' })
 })
 
-authRouter.post('/logout-all', authenticate, async (req: Request, res: Response) => {
+authRouter.post('/logout-all', authenticate, requireJson, async (req: Request, res: Response) => {
   const userId = req.user?.userId
   if (!userId) {
     res.status(401).json({ error: 'Unauthorized' })
@@ -142,7 +143,7 @@ authRouter.post('/logout-all', authenticate, async (req: Request, res: Response)
   res.json({ message: 'Successfully logged out from all devices' })
 })
 
-authRouter.post('/users/:id/role', (req, res) => {
+authRouter.post('/users/:id/role', requireJson, (req, res) => {
   const actorRole = req.header('x-user-role')
   const actorId = req.header('x-user-id')
 

@@ -20,10 +20,9 @@ import {
 } from '../services/vaultStore.js'
 import { normalizeCreateVaultInput, validateCreateVaultInput } from '../services/vaultValidation.js'
 import { queryParser } from '../middleware/queryParser.js'
-import { applyFilters, applySort, paginateArray } from '../utils/pagination.js'
-import { updateAnalyticsSummary } from '../db/database.js'
 import { utcNow } from '../utils/timestamps.js'
 import { prisma } from '../lib/prisma.js'
+import { requireJson } from '../middleware/requireJson.js'
 
 export const vaultsRouter = Router()
 
@@ -86,7 +85,7 @@ vaultsRouter.get(
 /**
  * POST /api/vaults
  */
-vaultsRouter.post('/', authenticate, async (req: Request, res: Response) => {
+vaultsRouter.post('/', authenticate, requireJson, async (req: Request, res: Response) => {
   const { creator, amount, endTimestamp, successDestination, failureDestination, milestoneHash, verifierAddress, contractId } = req.body
 
   if (!creator || !amount || !endTimestamp || !successDestination || !failureDestination) {
@@ -151,37 +150,6 @@ vaultsRouter.get('/:id', authenticate, async (req: Request, res: Response) => {
   if (!vault) {
     res.status(404).json({ error: 'Vault not found' })
     return
-    const responseBody = {
-      vault,
-      onChain: buildVaultCreationPayload(input, vault),
-      idempotency: { key: idempotencyKey, replayed: false },
-    }
-
-    if (idempotencyKey) {
-      await saveIdempotentResponse(idempotencyKey, requestHash, vault.id, responseBody, client ?? undefined)
-    }
-
-    const actorUserId = (req.header('x-user-id') ?? input.creator) || 'unknown'
-    createAuditLog({
-      actor_user_id: actorUserId,
-      action: 'vault.created',
-      target_type: 'vault',
-      target_id: vault.id,
-      metadata: { creator: input.creator, amount: input.amount },
-    })
-
-    if (client) await client.query('COMMIT')
-
-    // Trigger analytics update
-    updateAnalyticsSummary()
-
-    res.status(201).json(responseBody)
-  } catch (error) {
-    if (client) await client.query('ROLLBACK')
-    console.error('Vault creation failed', error)
-    res.status(500).json({ error: 'Failed to create vault.' })
-  } finally {
-    if (client) client.release()
   }
   res.json(vault)
 })
@@ -189,7 +157,7 @@ vaultsRouter.get('/:id', authenticate, async (req: Request, res: Response) => {
 /**
  * POST /api/vaults/:id/cancel
  */
-vaultsRouter.post('/:id/cancel', authenticate, async (req, res) => {
+vaultsRouter.post('/:id/cancel', authenticate, requireJson, async (req, res) => {
   const actorUserId = req.user!.userId
   const actorRole = req.user!.role
 

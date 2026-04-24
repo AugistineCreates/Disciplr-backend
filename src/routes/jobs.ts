@@ -11,6 +11,7 @@ import {
 import { authenticate, authorize } from '../middleware/auth.middleware.js'
 import { strictRateLimiter } from '../middleware/rateLimiter.js'
 import { createAuditLog } from '../lib/audit-logs.js'
+import { requireJson } from '../middleware/requireJson.js'
 
 
 
@@ -109,7 +110,7 @@ export const createJobsRouter = (jobSystem: BackgroundJobSystem, options: JobsRo
   })
 
   // POST /enqueue — manually trigger a background job (admin only, strict rate limit)
-  jobsRouter.post('/enqueue', enqueueLimiter, (req, res) => {
+  jobsRouter.post('/enqueue', enqueueLimiter, requireJson, (req, res) => {
     if (!isRecord(req.body)) {
       res.status(400).json({ error: 'Body must be a JSON object' })
       return
