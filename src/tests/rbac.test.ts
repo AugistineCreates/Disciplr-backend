@@ -49,6 +49,10 @@ beforeAll(async () => {
     }
   })
 
+  beforeEach(() => {
+    mockGetVerifierProfile.mockReset()
+  })
+
   it('role determination is based on JWT payload only', () => {
     // Simulate JWT payload structure
     const jwtPayload = {
@@ -91,11 +95,7 @@ beforeAll(async () => {
     expect(roleSource).toBe('JWT')
   })
 
-  beforeEach(() => {
-     mockGetVerifierProfile.mockReset()
-})
-
-describe('authenticate', () => {
+  describe('authenticate', () => {
      it('rejects request with no token', async () => {
           const res = await request(app).get('/user-route')
           expect(res.status).toBe(401)
@@ -110,7 +110,7 @@ describe('authenticate', () => {
           const res = await request(app).get('/user-route').set('Authorization', await tokenHelpers.user())
           expect(res.status).toBe(200)
      })
-})
+  })
 
 describe('RBAC: Error Response Consistency', () => {
   /**

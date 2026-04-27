@@ -3,6 +3,17 @@ import { createHash } from 'node:crypto'
 import { ParsedEvent } from '../types/horizonSync.js'
 import { getPgPool } from '../db/pool.js'
 
+interface StoredIdempotentResponse<T = unknown> {
+  requestHash: string
+  resourceId: string
+  response: T
+}
+
+const apiIdempotencyStore = new Map<string, StoredIdempotentResponse>()
+
+// Accepts alphanumeric, hyphens, underscores; 1–255 characters.
+export const IDEMPOTENCY_KEY_REGEX = /^[A-Za-z0-9_\-]{1,255}$/
+
 export class IdempotencyConflictError extends Error {
   readonly code = 'IDEMPOTENCY_CONFLICT'
   constructor(message = 'Idempotency key has already been used with a different payload.') {
@@ -88,6 +99,21 @@ export class IdempotencyService {
     this.db = db
   }
 
+  async checkAndRecord<T>(
+    key: string,
+    requestHash: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const existing = await getIdempotentResponse<T>(key, requestHash)
+    if (existing) {
+      return existing
+    }
+
+    const result = await operation()
+    await saveIdempotentResponse(key, requestHash, 'resource-id', result)
+    return result
+  }
+
   /**
    * Check if an event has already been processed.
    * 
@@ -121,43 +147,5 @@ export class IdempotencyService {
       created_at: new Date()
     })
   }
-
-  /**
-   * General-purpose idempotency check for API requests.
-   * Checks the idempotency_keys table.
-   * 
-   * @param key - The idempotency key provided by the client
-   * @returns Promise<any | null> - The stored response if found, null otherwise
-   */
-  async getStoredResponse(key: string): Promise<any | null> {
-    const record = await this.db('idempotency_keys')
-      .where({ key })
-      .first()
-    
-    return record ? record.response : null
-  }
-
-  /**
-   * Store a response for a given idempotency key.
-   * 
-   * @param key - The idempotency key
-   * @param response - The response payload to store
-   * @param trx - Optional transaction
-   */
-  async storeResponse(key: string, response: any, trx?: Knex.Transaction): Promise<void> {
-    await (trx || this.db)('idempotency_keys').insert({
-      key,
-      response: typeof response === 'string' ? response : JSON.stringify(response),
-      created_at: new Date()
-    })
-  }
 }
 
-/**
- * Reset the idempotency store (primarily for testing)
- */
-export async function resetIdempotencyStore(): Promise<void> {
-  const pool = getPgPool()
-  if (!pool) return
-  await pool.query('TRUNCATE TABLE idempotency_keys CASCADE')
-}

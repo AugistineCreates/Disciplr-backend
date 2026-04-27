@@ -57,38 +57,24 @@ export const requireAdmin = enforceRBAC({
   allow: [UserRole.ADMIN],
 })
 
-/**
- * Middleware that ensures the authenticated user is a Verifier with an 'approved' status.
- * Admins are automatically approved.
- */
+// Middleware to check if verifier has an active profile
 export const requireActiveVerifier = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-  if (!req.user) {
-    res.status(401).json({ error: 'Unauthorized' })
-    return
+  if (!req.user || req.user.role !== UserRole.VERIFIER) {
+    logRBACDenied(req, "not_verifier");
+    res.status(403).json({ error: "Forbidden", message: "Requires active verifier role" });
+    return;
   }
-
-  if (req.user.role === UserRole.ADMIN) {
-    return next()
-  }
-
-  if (req.user.role !== UserRole.VERIFIER) {
-    res.status(403).json({ error: 'Forbidden', message: 'Verifier role required' })
-    return
-  }
-
+  
   try {
-    const profile = await getVerifierProfile(req.user.userId)
-    if (!profile || profile.status !== 'approved') {
-      res.status(403).json({
-        error: 'Forbidden',
-        message: 'Verifier account is not active (pending, suspended, or deactivated)',
-      })
-      return
+    const profile = await getVerifierProfile(req.user.userId);
+    if (!profile || !profile.isActive) {
+      logRBACDenied(req, "verifier_not_active");
+      res.status(403).json({ error: "Forbidden", message: "Verifier account is not active" });
+      return;
     }
-    ;(req as any).verifier = profile
-    next()
+    next();
   } catch (error) {
-    console.error('Error checking verifier status:', error)
-    res.status(500).json({ error: 'Internal server error' })
+    logRBACDenied(req, "verifier_profile_error");
+    res.status(500).json({ error: "Internal server error" });
   }
-}
+};
