@@ -90,6 +90,23 @@ hash, which is decoded to `BytesN<32>` before calling the contract.
 The `create_vault` function validates that milestone amounts are positive and sum exactly to
 the declared `amount`, rejecting mismatches with `Error::AmountMismatch`.
 
+### Monotonic Milestone Due Dates
+
+To prevent confusion for downstream consumers like the backend and analytics ETL, `create_vault` requires milestone due dates to be strictly increasing (monotonic). This means each milestone's `due_date` must be strictly greater than the previous one. Duplicate or out-of-order due dates are rejected with `Error::InvalidDeadline`.
+
+Example valid ordering:
+- Milestone 0: `due_date = 1_200`
+- Milestone 1: `due_date = 1_400`
+- Milestone 2: `due_date = 1_600`
+
+Example invalid (duplicate):
+- Milestone 0: `due_date = 1_200`
+- Milestone 1: `due_date = 1_200` → Rejected
+
+Example invalid (out-of-order):
+- Milestone 0: `due_date = 1_400`
+- Milestone 1: `due_date = 1_200` → Rejected
+
 ### Checked Milestone Access
 
 Contract code must not use `unwrap()` when reading milestones by caller-supplied indexes.
