@@ -8,7 +8,8 @@ import {
   listOrgMemberships,
   createMembership,
   removeMembership,
-  updateMemberRole,
+  changeRole,
+  transferOwnership,
   LastAdminError,
 } from '../services/membership.js'
 import type { OrgRole } from '../models/organizations.js'
@@ -147,15 +148,7 @@ orgMembersRouter.patch(
     }
 
     try {
-      const updated = await updateMemberRole(userId, orgId, role as OrgRole)
-
-      createAuditLog({
-        actor_user_id: req.user!.userId,
-        action: 'org.member.role_changed',
-        target_type: 'org_membership',
-        target_id: `${orgId}:${userId}`,
-        metadata: { orgId, newRole: role },
-      })
+      const updated = await changeRole(userId, orgId, role as OrgRole, req.user!.userId)
 
       res.status(200).json({
         orgId,
@@ -163,12 +156,38 @@ orgMembersRouter.patch(
         role: updated.role,
       })
     } catch (err) {
-      if (err instanceof LastAdminError) {
-        return next(AppError.unprocessable(err.message))
+      if (err instanceof LastAdminError || (err instanceof Error && err.message.includes('owner'))) {
+        return next(AppError.unprocessable(err instanceof Error ? err.message : 'Cannot process.'))
       }
 
       const message = err instanceof Error ? err.message : 'Failed to update role.'
       return next(AppError.notFound(message))
+    }
+  },
+)
+
+// ─── POST /api/organizations/:orgId/transfer-ownership ──────────────────────
+// Transfer ownership of an organization to another member.
+// Demotes current owner to admin.
+
+orgMembersRouter.post(
+  '/:orgId/transfer-ownership',
+  authenticate,
+  requireOrgAccess('owner'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { orgId } = req.params
+    const { newOwnerId } = req.body as { newOwnerId?: string }
+
+    if (!newOwnerId) {
+      return next(AppError.badRequest('newOwnerId is required.'))
+    }
+
+    try {
+      await transferOwnership(orgId, req.user!.userId, newOwnerId)
+      res.status(200).json({ message: 'Ownership transferred.', orgId, newOwnerId })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to transfer ownership.'
+      return next(AppError.unprocessable(message))
     }
   },
 )
