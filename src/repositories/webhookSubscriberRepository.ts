@@ -8,6 +8,7 @@ interface SubscriberRow {
   secret: string
   events: string[]
   active: boolean
+  schema_version: number
   created_at: Date
   updated_at: Date
 }
@@ -31,6 +32,7 @@ function toSubscriber(row: SubscriberRow): WebhookSubscriber {
     secret: row.secret,
     events: row.events ?? [],
     active: row.active,
+    schemaVersion: row.schema_version ?? 1,
     createdAt: row.created_at instanceof Date
       ? row.created_at.toISOString()
       : String(row.created_at),
@@ -90,6 +92,7 @@ export class WebhookSubscriberRepository {
     url: string
     secret: string
     events: string[]
+    schemaVersion?: number
   }): Promise<WebhookSubscriber> {
     const [row] = await this.db<SubscriberRow>('webhook_subscribers')
       .insert({
@@ -97,6 +100,7 @@ export class WebhookSubscriberRepository {
         url: data.url,
         secret: data.secret,
         events: JSON.stringify(data.events) as any,
+        schema_version: data.schemaVersion ?? 1,
       })
       .returning('*')
     return toSubscriber(row)

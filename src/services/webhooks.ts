@@ -24,7 +24,12 @@ export interface WebhookSubscriber {
   events: string[]
   active: boolean
   createdAt: string
+  schemaVersion: number
 }
+
+export const LATEST_SCHEMA_VERSION = 2
+export const DEFAULT_SCHEMA_VERSION = 1
+export const SUPPORTED_SCHEMA_VERSIONS = new Set([1, 2])
 
 export interface WebhookDeliveryPayload {
   /** Originating event id in {txHash}:{eventIndex} format */
@@ -61,6 +66,46 @@ export interface CircuitBreakerConfig {
   threshold: number
   windowMs: number
   halfOpenTimeoutMs: number
+}
+
+// ── Payload schema versioning ─────────────────────────────────────────────────
+
+/**
+ * Builds the HTTP request body for a webhook delivery according to the
+ * subscriber's preferred schema version.
+ *
+ * v1 – Original shape with schema_version appended:
+ *   { eventId, eventType, timestamp, data, organizationId, schema_version: 1 }
+ *
+ * v2 – Compact envelope:
+ *   { schema_version: 2, event_type, data }
+ */
+export const buildVersionedPayload = (
+  subscriber: WebhookSubscriber,
+  payload: WebhookDeliveryPayload,
+): string => {
+  switch (subscriber.schemaVersion) {
+    case 1:
+      return JSON.stringify({
+        eventId: payload.eventId,
+        eventType: payload.eventType,
+        timestamp: payload.timestamp,
+        data: payload.data,
+        organizationId: payload.organizationId,
+        schema_version: 1,
+      })
+    case 2:
+      return JSON.stringify({
+        schema_version: 2,
+        event_type: payload.eventType,
+        data: payload.data,
+      })
+    default:
+      throw new Error(
+        `Unsupported webhook schema version: ${subscriber.schemaVersion}. ` +
+        `Supported versions: ${[...SUPPORTED_SCHEMA_VERSIONS].join(', ')}`,
+      )
+  }
 }
 
 /** Vault lifecycle event types that trigger webhook delivery. */
@@ -346,12 +391,20 @@ export const addSubscriber = async (
   url: string,
   secret: string,
   events: string[],
+  schemaVersion: number = DEFAULT_SCHEMA_VERSION,
 ): Promise<WebhookSubscriber> => {
   if (!isUrlAllowed(url)) {
     throw new Error(`Webhook URL not permitted: ${url}`)
   }
 
-  return repo.create({ organizationId, url, secret, events })
+  if (!SUPPORTED_SCHEMA_VERSIONS.has(schemaVersion)) {
+    throw new Error(
+      `Unsupported webhook schema version: ${schemaVersion}. ` +
+      `Supported versions: ${[...SUPPORTED_SCHEMA_VERSIONS].join(', ')}`,
+    )
+  }
+
+  return repo.create({ organizationId, url, secret, events, schemaVersion })
 }
 
 export const removeSubscriber = async (id: string): Promise<boolean> => {
@@ -377,7 +430,7 @@ const deliverOnce = async (
   payload: WebhookDeliveryPayload,
   timeoutMs = 10_000,
 ): Promise<number> => {
-  const body = JSON.stringify(payload)
+  const body = buildVersionedPayload(subscriber, payload)
   const signature = signPayload(subscriber.secret, body)
 
   const controller = new AbortController()

@@ -151,6 +151,7 @@ Webhook subscribers are stored in the `webhook_subscribers` table:
 | `secret` | `text` | HMAC signing secret |
 | `events` | `jsonb` | Array of event types to receive; empty array = wildcard (all events) |
 | `active` | `boolean` | Whether the subscriber is active |
+| `schema_version` | `integer` (default `1`) | Payload schema version (see Payload Schema Versioning) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last update timestamp |
 
@@ -172,9 +173,11 @@ All subscriber queries are scoped by `organization_id`. When dispatching events,
 
 ## API
 
-### `addSubscriber(organizationId, url, secret, events)`
+### `addSubscriber(organizationId, url, secret, events, schemaVersion = 1)`
 
 Creates a new webhook subscriber. The URL is validated against the SSRF allowlist (`isUrlAllowed`). Returns the created subscriber.
+
+Optional `schemaVersion` selects the payload envelope version (default `1`). Must be a supported version (see Payload Schema Versioning).
 
 ### `removeSubscriber(id)`
 
@@ -187,6 +190,44 @@ Returns all active subscribers for an organization.
 ### `dispatchWebhookEvent(payload)`
 
 Delivers an event to all eligible active subscribers for the organization specified in `payload.organizationId`. Uses exponential-backoff retry (max 3 attempts). Failures are collected per-subscriber.
+
+---
+
+## Payload Schema Versioning
+
+Each subscriber selects a payload schema version (`schema_version`). The version determines the JSON envelope delivered to the subscriber's endpoint.
+
+### Supported Versions
+
+| Version | Envelope | Notes |
+|---------|----------|-------|
+| **1** (default) | `{ eventId, eventType, timestamp, data, organizationId, schema_version: 1 }` | Original shape — includes all fields from the internal payload with `schema_version` appended. |
+| **2** | `{ schema_version: 2, event_type, data }` | Compact envelope. Omits `eventId`, `timestamp`, and `organizationId`. The event type key is `event_type` (snake_case). |
+
+### Adding a Subscriber with a Specific Version
+
+```typescript
+// Defaults to version 1
+await addSubscriber(orgId, url, secret, events)
+
+// Explicit version 2
+await addSubscriber(orgId, url, secret, events, 2)
+```
+
+### Delivery Behaviour
+
+- The HTTP body delivered to the subscriber is the serialized versioned envelope.
+- The `x-disciplr-signature` HMAC is computed over the versioned body, so the signature covers the full envelope.
+- The `x-disciplr-event`, `x-disciplr-event-id`, and `x-disciplr-delivery-timestamp` headers are identical across all schema versions.
+
+### Deprecation Policy
+
+1. When a new schema version is introduced, the previous version enters **deprecated** status.
+2. Deprecated versions remain functional for **90 days** after the successor version is marked stable.
+3. During the deprecation window subscribers on the old version receive **warning** log lines on each delivery.
+4. After the deprecation window expires the old version is **removed** and `addSubscriber` rejects it. Existing subscribers that still reference the removed version are downgraded to the earliest still-supported version and logged.
+5. The `LATEST_SCHEMA_VERSION` constant always points to the current stable version.
+6. The `SUPPORTED_SCHEMA_VERSIONS` set contains all versions that are neither removed nor deprecated.
 
 ---
 

@@ -72,6 +72,7 @@ const makeSubscriber = (overrides: Record<string, any> = {}) => ({
   secret: 'test-secret',
   events: [],
   active: true,
+  schemaVersion: 1,
   createdAt: new Date().toISOString(),
   ...overrides,
 })
@@ -113,6 +114,7 @@ beforeEach(() => {
       secret: data.secret,
       events: [...data.events],
       active: true,
+      schemaVersion: data.schemaVersion ?? 1,
       createdAt: new Date().toISOString(),
     }
     mockSubscribers.push(sub)

@@ -28,6 +28,7 @@ jest.unstable_mockModule('../repositories/webhookSubscriberRepository.js', () =>
         url: string
         secret: string
         events: string[]
+        schemaVersion?: number
       }): Promise<WebhookSubscriber> => {
         const sub: WebhookSubscriber = {
           id: randomUUID(),
@@ -36,6 +37,7 @@ jest.unstable_mockModule('../repositories/webhookSubscriberRepository.js', () =>
           secret: data.secret,
           events: [...data.events],
           active: true,
+          schemaVersion: data.schemaVersion ?? 1,
           createdAt: new Date().toISOString(),
         }
         mockSubscribers.push(sub)
