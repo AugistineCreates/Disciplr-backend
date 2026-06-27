@@ -3,6 +3,12 @@ import { processJob as processExportJob } from '../services/exportQueue.js'
 import type { JobHandler, JobType } from './types.js'
 import { markVaultExpiries } from '../services/vaultExpiry.service.js'
 import { cleanupExpiredSessions } from '../services/session.js'
+import {
+  runReindexBatches,
+  type MilestoneEmbeddingSource,
+  type ReindexCursorStore,
+} from '../services/evidenceReindex.js'
+import type { EmbeddingProvider } from '../services/embeddingProvider.js'
 
 type JobHandlerRegistry = {
   [K in JobType]: JobHandler<K>
@@ -18,8 +24,15 @@ const logJob = (type: JobType, message: string): void => {
   console.log(`[jobs:${type}] ${message}`)
 }
 
+export interface EmbeddingReindexDependencies {
+  source: MilestoneEmbeddingSource
+  cursorStore: ReindexCursorStore
+  embeddingProvider: EmbeddingProvider
+}
+
 export const createDefaultJobHandlers = (
   notificationService: NotificationService,
+  embeddingReindex: EmbeddingReindexDependencies,
 ): JobHandlerRegistry => ({
   'notification.send': async (payload, context) => {
     await notificationService.send(payload.recipient, payload.subject, payload.body)
@@ -72,6 +85,20 @@ export const createDefaultJobHandlers = (
     logJob(
       'sessions.cleanup',
       `deleted=${deleted} batchSize=${batchSize} attempt=${context.attempt}`,
+    )
+  },
+  'embeddings.reindex': async (payload, context) => {
+    const result = await runReindexBatches({
+      source: embeddingReindex.source,
+      cursorStore: embeddingReindex.cursorStore,
+      embeddingProvider: embeddingReindex.embeddingProvider,
+      batchSize: payload.batchSize,
+      maxBatchesPerRun: payload.maxBatchesPerRun,
+    })
+    logJob(
+      'embeddings.reindex',
+      `batches=${result.batches} processed=${result.processed} reindexed=${result.reindexed} ` +
+        `skipped=${result.skippedUpToDate} cursor=${result.cursor ?? 'none'} done=${result.done} attempt=${context.attempt}`,
     )
   },
 })

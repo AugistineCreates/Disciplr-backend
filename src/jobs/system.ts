@@ -1,4 +1,4 @@
-import { createDefaultJobHandlers } from './handlers.js'
+import { createDefaultJobHandlers, type EmbeddingReindexDependencies } from './handlers.js'
 import { InMemoryJobQueue, type QueueMetrics, type QueuedJobReceipt } from './queue.js'
 import { type EnqueueOptions, type JobPayloadByType, type JobType } from './types.js'
 import { recoverPendingExportJobs } from '../services/exportQueue.js'
@@ -6,6 +6,10 @@ import {
   createNotificationService,
   type NotificationService,
 } from '../services/notifications/factory.js'
+import { db } from '../db/index.js'
+import { MilestoneRepository } from '../repositories/milestoneRepository.js'
+import { BackfillCursorStore } from '../services/backfillCursorStore.js'
+import { createEmbeddingProvider } from '../services/embeddingProvider.js'
 
 const parsePositiveInteger = (value: string | undefined, fallback: number): number => {
   if (!value) {
@@ -26,7 +30,10 @@ export class BackgroundJobSystem {
   private started = false
   private shuttingDown = false
 
-  constructor(notificationService?: NotificationService) {
+  constructor(
+    notificationService?: NotificationService,
+    embeddingReindex?: EmbeddingReindexDependencies,
+  ) {
     this.queue = new InMemoryJobQueue({
       concurrency: parsePositiveInteger(process.env.JOB_WORKER_CONCURRENCY, 2),
       pollIntervalMs: parsePositiveInteger(process.env.JOB_QUEUE_POLL_INTERVAL_MS, 250),
@@ -34,7 +41,12 @@ export class BackgroundJobSystem {
     })
     const resolvedNotificationService =
       notificationService ?? createNotificationService(process.env.NOTIFICATION_PROVIDER ?? 'console')
-    const handlers = createDefaultJobHandlers(resolvedNotificationService)
+    const resolvedEmbeddingReindex = embeddingReindex ?? {
+      source: new MilestoneRepository(db),
+      cursorStore: new BackfillCursorStore(db),
+      embeddingProvider: createEmbeddingProvider(),
+    }
+    const handlers = createDefaultJobHandlers(resolvedNotificationService, resolvedEmbeddingReindex)
 
     this.queue.registerHandler('notification.send', handlers['notification.send'])
     this.queue.registerHandler('deadline.check', handlers['deadline.check'])
@@ -42,6 +54,7 @@ export class BackgroundJobSystem {
     this.queue.registerHandler('analytics.recompute', handlers['analytics.recompute'])
     this.queue.registerHandler('export.generate', handlers['export.generate'])
     this.queue.registerHandler('sessions.cleanup', handlers['sessions.cleanup'])
+    this.queue.registerHandler('embeddings.reindex', handlers['embeddings.reindex'])
   }
 
   start(): void {
@@ -123,6 +136,10 @@ export class BackgroundJobSystem {
       process.env.SESSIONS_CLEANUP_INTERVAL_MS,
       86_400_000, // 24 hours
     )
+    const embeddingReindexIntervalMs = parsePositiveInteger(
+      process.env.EMBEDDING_REINDEX_INTERVAL_MS,
+      600_000, // 10 minutes
+    )
 
     this.enqueue('deadline.check', {
       triggerSource: 'scheduler',
@@ -136,6 +153,7 @@ export class BackgroundJobSystem {
       { delayMs: 5_000 },
     )
     this.enqueue('sessions.cleanup', {}, { delayMs: 10_000 })
+    this.enqueue('embeddings.reindex', {}, { delayMs: 15_000 })
 
     const deadlineTimer = setInterval(() => {
       this.enqueue('deadline.check', { triggerSource: 'scheduler' })
@@ -152,6 +170,10 @@ export class BackgroundJobSystem {
       this.enqueue('sessions.cleanup', {})
     }, sessionsCleanupIntervalMs)
 
+    const embeddingReindexTimer = setInterval(() => {
+      this.enqueue('embeddings.reindex', {})
+    }, embeddingReindexIntervalMs)
+
     if (typeof deadlineTimer.unref === 'function') {
       deadlineTimer.unref()
     }
@@ -161,7 +183,10 @@ export class BackgroundJobSystem {
     if (typeof sessionsTimer.unref === 'function') {
       sessionsTimer.unref()
     }
+    if (typeof embeddingReindexTimer.unref === 'function') {
+      embeddingReindexTimer.unref()
+    }
 
-    this.scheduleTimers.push(deadlineTimer, analyticsTimer, sessionsTimer)
+    this.scheduleTimers.push(deadlineTimer, analyticsTimer, sessionsTimer, embeddingReindexTimer)
   }
 }

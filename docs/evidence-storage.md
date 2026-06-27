@@ -36,3 +36,11 @@ This table is created by the new database migration `db/migrations/2026052700000
 
 Audit logs do not include the raw signed URL.
 Only evidence metadata such as `evidenceHash` and the fact that evidence was attached are recorded.
+
+## Relationship to milestone embeddings
+
+This service intentionally does **not** generate or store embeddings — see "What is not stored"
+above. Similarity-search embeddings for milestones (used for near-duplicate / low-effort
+submission detection) are a separate subsystem keyed by `milestone_id`, not evidence rows, and are
+kept in sync by an offline reindex backfill job. See "Embedding reindex backfill job" in
+`docs/milestones.md` for that job's design, resumability, and rate-limiting.

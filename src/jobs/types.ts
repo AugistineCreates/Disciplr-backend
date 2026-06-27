@@ -5,6 +5,7 @@ export const JOB_TYPES = [
   'analytics.recompute',
   'export.generate',
   'sessions.cleanup',
+  'embeddings.reindex',
 ] as const
 
 export type JobType = (typeof JOB_TYPES)[number]
@@ -41,6 +42,11 @@ export interface SessionsCleanupJobPayload {
   batchSize?: number
 }
 
+export interface EmbeddingsReindexJobPayload {
+  batchSize?: number
+  maxBatchesPerRun?: number
+}
+
 export interface JobPayloadByType {
   'notification.send': NotificationJobPayload
   'deadline.check': DeadlineCheckJobPayload
@@ -48,6 +54,7 @@ export interface JobPayloadByType {
   'analytics.recompute': AnalyticsRecomputeJobPayload
   'export.generate': ExportGenerateJobPayload
   'sessions.cleanup': SessionsCleanupJobPayload
+  'embeddings.reindex': EmbeddingsReindexJobPayload
 }
 
 export interface JobContext {
@@ -122,6 +129,12 @@ export const isPayloadForJobType = (
       return isNonEmptyString(payload.exportJobId)
     case 'sessions.cleanup':
       return payload.batchSize === undefined || (typeof payload.batchSize === 'number' && payload.batchSize > 0)
+    case 'embeddings.reindex':
+      return (
+        (payload.batchSize === undefined || (typeof payload.batchSize === 'number' && payload.batchSize > 0)) &&
+        (payload.maxBatchesPerRun === undefined ||
+          (typeof payload.maxBatchesPerRun === 'number' && payload.maxBatchesPerRun > 0))
+      )
     default:
       return false
   }
