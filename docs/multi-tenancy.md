@@ -44,6 +44,7 @@ org-scoped endpoint must uphold.
 | `POST /api/organizations/:orgId/members`    | `owner`, `admin`            |
 | `DELETE /api/organizations/:orgId/members/:userId` | `owner`, `admin`   |
 | `PATCH /api/organizations/:orgId/members/:userId/role` | `owner`        |
+| `POST /api/organizations/:orgId/transfer-ownership` | `owner`         |
 | `POST /api/organizations/:orgId/invitations` | `owner`, `admin`           |
 | `POST /api/organizations/:orgId/invitations/:id/resend` | `owner`, `admin` |
 | `DELETE /api/organizations/:orgId/invitations/:id` | `owner`, `admin` |
@@ -86,6 +87,18 @@ substitute another org's ID to access its data.
 A user may belong to multiple organizations with different roles in each. The middleware
 evaluates membership and role against the `orgId` in the current request only. Membership
 in org B grants no access to org A's endpoints.
+
+## Role Transitions & Ownership Transfer
+
+Membership role transitions are explicitly audited and protected by invariants to prevent organizations from being orphaned:
+
+1. **Last Admin/Owner Invariants**: 
+   - An organization must always have at least one `owner`. 
+   - Demoting or removing the last owner will be rejected with an error.
+   - An organization must also maintain at least one `admin` or `owner` (an owner counts as an admin in terms of org management).
+2. **Auditing**: Every role change emits an `org.member.role_changed` audit log. Ownership transfers emit an `org.ownership.transferred` audit log.
+3. **Ownership Transfer**: A dedicated `POST /api/organizations/:orgId/transfer-ownership` endpoint exists. It atomically promotes the target user to `owner` and demotes the current owner to `admin`. Only current owners can initiate a transfer.
+4. **Idempotency**: Applying the same role to a member is a no-op and simply returns success without side-effects or duplicate audit logs.
 
 ## Organization invitation flow
 
