@@ -9,6 +9,9 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+// Exported so callers implementing custom storage can signal owner violations.
+// Not thrown by the default in-memory or DB-backed implementations —
+// key namespacing handles isolation instead.
 export class IdempotencyOwnerMismatchError extends Error {
   constructor(message = 'Idempotency key belongs to a different owner') {
     super(message)
@@ -43,16 +46,18 @@ const idempotencyStore = new Map<string, StoreEntry>()
 const pendingIdempotencyRequests = new Map<string, PendingIdempotencyRequest>()
 let idempotencyTtlMs = Number(process.env.IDEMPOTENCY_TTL_MS ?? 60 * 60 * 1000)
 
-function isPrincipalOwner(
-  storedUserId: string | null,
-  storedOrgId: string | null,
-  owner: OwnerContext,
-): boolean {
-  // Legacy / anonymous entries (both null) are accessible to any caller
-  if (storedUserId === null && storedOrgId === null) return true
-  if (storedUserId !== null && storedUserId !== owner.userId) return false
-  if (storedOrgId !== null && storedOrgId !== owner.orgId) return false
-  return true
+/**
+ * Derives a principal-scoped internal key so that two users sharing the same
+ * client-supplied key string never see each other's cached responses.
+ *
+ * Preference order: org-level (API keys) → user-level (JWT) → raw (anonymous).
+ * Opaque to the caller; matches the contract documented in docs/idempotency.md.
+ */
+export function buildInternalKey(clientKey: string, owner?: OwnerContext): string {
+  if (!owner) return clientKey
+  if (owner.orgId) return `org:${owner.orgId}:${clientKey}`
+  if (owner.userId) return `user:${owner.userId}:${clientKey}`
+  return clientKey
 }
 
 export function hashRequestPayload(body: unknown): string {
@@ -76,18 +81,16 @@ export async function getIdempotentResponse<T>(
   hash: string,
   owner?: OwnerContext,
 ): Promise<T | null> {
+  const internalKey = buildInternalKey(key, owner)
   pruneExpiredEntries()
 
-  const pending = pendingIdempotencyRequests.get(key)
+  const pending = pendingIdempotencyRequests.get(internalKey)
   if (pending) {
-    if (owner && !isPrincipalOwner(pending.userId, pending.orgId, owner)) {
-      throw new IdempotencyOwnerMismatchError()
-    }
     if (pending.hash !== hash) throw new IdempotencyConflictError()
     return pending.promise as Promise<T>
   }
 
-  const entry = idempotencyStore.get(key)
+  const entry = idempotencyStore.get(internalKey)
   if (!entry) {
     let resolve!: (value: unknown) => void
     let reject!: (reason?: unknown) => void
@@ -96,7 +99,7 @@ export async function getIdempotentResponse<T>(
       reject = rej
     })
 
-    pendingIdempotencyRequests.set(key, {
+    pendingIdempotencyRequests.set(internalKey, {
       hash,
       promise,
       resolve,
@@ -105,10 +108,6 @@ export async function getIdempotentResponse<T>(
       orgId: owner?.orgId ?? null,
     })
     return null
-  }
-
-  if (owner && !isPrincipalOwner(entry.userId, entry.orgId, owner)) {
-    throw new IdempotencyOwnerMismatchError()
   }
 
   if (entry.hash !== hash) throw new IdempotencyConflictError()
@@ -122,15 +121,16 @@ export async function saveIdempotentResponse(
   response: unknown,
   owner?: OwnerContext,
 ): Promise<void> {
+  const internalKey = buildInternalKey(key, owner)
   pruneExpiredEntries()
 
-  const pending = pendingIdempotencyRequests.get(key)
+  const pending = pendingIdempotencyRequests.get(internalKey)
   if (pending) {
-    pendingIdempotencyRequests.delete(key)
+    pendingIdempotencyRequests.delete(internalKey)
     pending.resolve(response)
   }
 
-  idempotencyStore.set(key, {
+  idempotencyStore.set(internalKey, {
     hash,
     response,
     expiresAt: Date.now() + idempotencyTtlMs,
@@ -139,13 +139,19 @@ export async function saveIdempotentResponse(
   })
 }
 
-export function failPendingIdempotentResponse(key: string, hash: string, error: unknown): void {
-  const pending = pendingIdempotencyRequests.get(key)
+export function failPendingIdempotentResponse(
+  key: string,
+  hash: string,
+  error: unknown,
+  owner?: OwnerContext,
+): void {
+  const internalKey = buildInternalKey(key, owner)
+  const pending = pendingIdempotencyRequests.get(internalKey)
   if (!pending || pending.hash !== hash) {
     return
   }
 
-  pendingIdempotencyRequests.delete(key)
+  pendingIdempotencyRequests.delete(internalKey)
   pending.reject(error)
 }
 
@@ -201,29 +207,25 @@ export class IdempotencyService {
 
   /**
    * General-purpose idempotency check for API requests.
-   * Checks the idempotency_keys table and validates owner binding.
+   * Looks up the principal-scoped internal key; user_id / org_id columns
+   * are stored for auditing but are not used for access control here —
+   * the namespaced key guarantees isolation between principals.
    *
-   * @param key - The idempotency key provided by the client
+   * @param key - The client-supplied idempotency key
    * @param owner - The authenticated principal making the request
-   * @returns Promise<any | null> - The stored response if found and owner matches, null otherwise
-   * @throws IdempotencyOwnerMismatchError if the key belongs to a different owner
+   * @returns Promise<any | null> - The stored response if found, null otherwise
    */
   async getStoredResponse(key: string, owner?: OwnerContext): Promise<any | null> {
-    const record = await this.db('idempotency_keys').where({ key }).first()
-
-    if (!record) return null
-
-    if (owner && !isPrincipalOwner(record.user_id ?? null, record.org_id ?? null, owner)) {
-      throw new IdempotencyOwnerMismatchError()
-    }
-
-    return record.response
+    const internalKey = buildInternalKey(key, owner)
+    const record = await this.db('idempotency_keys').where({ key: internalKey }).first()
+    return record ? record.response : null
   }
 
   /**
    * Store a response for a given idempotency key, bound to the requesting owner.
+   * Stores user_id / org_id for auditing alongside the namespaced key.
    *
-   * @param key - The idempotency key
+   * @param key - The client-supplied idempotency key
    * @param response - The response payload to store
    * @param owner - The authenticated principal to bind the key to
    * @param trx - Optional transaction
@@ -234,8 +236,9 @@ export class IdempotencyService {
     owner?: OwnerContext,
     trx?: Knex.Transaction,
   ): Promise<void> {
+    const internalKey = buildInternalKey(key, owner)
     await (trx || this.db)('idempotency_keys').insert({
-      key,
+      key: internalKey,
       response: typeof response === 'string' ? response : JSON.stringify(response),
       user_id: owner?.userId ?? null,
       org_id: owner?.orgId ?? null,

@@ -13,7 +13,6 @@ import {
   saveIdempotentResponse,
   failPendingIdempotentResponse,
   IdempotencyConflictError,
-  IdempotencyOwnerMismatchError,
   type OwnerContext,
 } from '../services/idempotency.js'
 import { buildVaultCreationPayload } from '../services/soroban.js'
@@ -89,12 +88,6 @@ vaultsRouter.post('/', authenticate, async (req: Request, res: Response, next: N
         return
       }
     } catch (err) {
-      if (err instanceof IdempotencyOwnerMismatchError) {
-        res.status(403).json({
-          error: { code: 'IDEMPOTENCY_OWNER_MISMATCH', message: err.message },
-        })
-        return
-      }
       if (err instanceof IdempotencyConflictError) {
         res.status(409).json({
           error: {
@@ -158,7 +151,7 @@ vaultsRouter.post('/', authenticate, async (req: Request, res: Response, next: N
     res.status(201).json(responseBody)
   } catch (error) {
     if (idempotencyKey) {
-      failPendingIdempotentResponse(idempotencyKey, requestHash, error)
+      failPendingIdempotentResponse(idempotencyKey, requestHash, error, owner)
     }
 
     console.error('Vault creation failed', error)

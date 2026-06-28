@@ -3,19 +3,22 @@ import type { Knex } from 'knex'
 import {
   getIdempotentResponse,
   saveIdempotentResponse,
+  failPendingIdempotentResponse,
   resetIdempotencyStore,
   hashRequestPayload,
+  buildInternalKey,
   IdempotencyConflictError,
-  IdempotencyOwnerMismatchError,
   IdempotencyService,
   type OwnerContext,
 } from '../services/idempotency.js'
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const OWNER_A: OwnerContext = { userId: 'user-alpha', orgId: 'org-1' }
-const OWNER_B: OwnerContext = { userId: 'user-beta', orgId: 'org-1' }
-const OWNER_A_ORG2: OwnerContext = { userId: 'user-alpha', orgId: 'org-2' }
+const OWNER_A: OwnerContext = { userId: 'user-alpha', orgId: null }
+const OWNER_B: OwnerContext = { userId: 'user-beta', orgId: null }
+const OWNER_ORG1: OwnerContext = { userId: null, orgId: 'org-1' }
+const OWNER_ORG2: OwnerContext = { userId: null, orgId: 'org-2' }
+const OWNER_USER_IN_ORG: OwnerContext = { userId: 'user-alpha', orgId: 'org-1' }
 const ANON: OwnerContext = { userId: null, orgId: null }
 
 const PAYLOAD = { amount: '500', creator: 'GABC' }
@@ -32,9 +35,41 @@ function makeMockDb(record: Record<string, unknown> | null) {
   return { db: table as unknown as Knex, mocks: { where, first, insert } }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// ─── buildInternalKey ─────────────────────────────────────────────────────────
 
-describe('idempotency owner binding — in-memory store', () => {
+describe('buildInternalKey', () => {
+  it('returns raw key when no owner provided', () => {
+    expect(buildInternalKey('k')).toBe('k')
+  })
+
+  it('returns raw key for anonymous owner (both null)', () => {
+    expect(buildInternalKey('k', ANON)).toBe('k')
+  })
+
+  it('prefixes with user: when only userId is set', () => {
+    expect(buildInternalKey('k', OWNER_A)).toBe('user:user-alpha:k')
+  })
+
+  it('prefixes with org: when orgId is set (takes precedence over userId)', () => {
+    expect(buildInternalKey('k', OWNER_USER_IN_ORG)).toBe('org:org-1:k')
+  })
+
+  it('prefixes with org: when only orgId is set (API key)', () => {
+    expect(buildInternalKey('k', OWNER_ORG1)).toBe('org:org-1:k')
+  })
+
+  it('produces distinct internal keys for distinct user IDs', () => {
+    expect(buildInternalKey('k', OWNER_A)).not.toBe(buildInternalKey('k', OWNER_B))
+  })
+
+  it('produces distinct internal keys for distinct org IDs', () => {
+    expect(buildInternalKey('k', OWNER_ORG1)).not.toBe(buildInternalKey('k', OWNER_ORG2))
+  })
+})
+
+// ─── In-memory store — owner isolation via namespacing ───────────────────────
+
+describe('idempotency store — principal isolation', () => {
   beforeEach(() => {
     resetIdempotencyStore()
   })
@@ -48,20 +83,20 @@ describe('idempotency owner binding — in-memory store', () => {
       expect(result).toEqual(RESPONSE)
     })
 
-    it('returns null (miss) when key is not yet stored', async () => {
-      const result = await getIdempotentResponse('unknown-key', HASH, OWNER_A)
+    it('returns null (cache miss) for an unknown key', async () => {
+      const result = await getIdempotentResponse('never-stored', HASH, OWNER_A)
       expect(result).toBeNull()
     })
 
-    it('throws IdempotencyConflictError when owner matches but hash differs (payload changed)', async () => {
+    it('throws IdempotencyConflictError when owner matches but hash differs', async () => {
       await saveIdempotentResponse('k2', HASH, 'v2', RESPONSE, OWNER_A)
-      const differentHash = hashRequestPayload({ amount: '999' })
-      await expect(getIdempotentResponse('k2', differentHash, OWNER_A)).rejects.toThrow(
+      const altHash = hashRequestPayload({ amount: '999' })
+      await expect(getIdempotentResponse('k2', altHash, OWNER_A)).rejects.toThrow(
         IdempotencyConflictError,
       )
     })
 
-    it('never discloses stored data via the conflict error', async () => {
+    it('conflict error does not include stored response data', async () => {
       await saveIdempotentResponse('k3', HASH, 'v3', { secret: 'tenant-data' }, OWNER_A)
       const err = await getIdempotentResponse('k3', 'wrong-hash', OWNER_A).catch((e) => e)
       expect(err).toBeInstanceOf(IdempotencyConflictError)
@@ -69,125 +104,139 @@ describe('idempotency owner binding — in-memory store', () => {
     })
   })
 
-  // ── Cross-user key reuse ────────────────────────────────────────────────────
+  // ── Cross-user isolation (namespaced keys are independent) ─────────────────
 
-  describe('cross-user key reuse rejection', () => {
-    it('throws IdempotencyOwnerMismatchError when a different user replays the key', async () => {
-      await saveIdempotentResponse('k4', HASH, 'v4', RESPONSE, OWNER_A)
-      await expect(getIdempotentResponse('k4', HASH, OWNER_B)).rejects.toThrow(
-        IdempotencyOwnerMismatchError,
-      )
+  describe('cross-user key isolation', () => {
+    it('different users using the same client key get independent cache entries', async () => {
+      await saveIdempotentResponse('shared-key', HASH, 'va', { owner: 'a' }, OWNER_A)
+      await saveIdempotentResponse('shared-key', HASH, 'vb', { owner: 'b' }, OWNER_B)
+
+      const resultA = await getIdempotentResponse('shared-key', HASH, OWNER_A)
+      const resultB = await getIdempotentResponse('shared-key', HASH, OWNER_B)
+
+      expect(resultA).toEqual({ owner: 'a' })
+      expect(resultB).toEqual({ owner: 'b' })
     })
 
-    it('never returns stored response to a mismatched user (data isolation)', async () => {
-      await saveIdempotentResponse('k5', HASH, 'v5', { secret: 'owner-a-data' }, OWNER_A)
-      let result: unknown = null
-      try {
-        result = await getIdempotentResponse('k5', HASH, OWNER_B)
-      } catch {
-        // expected mismatch error
-      }
+    it('user B gets a cache miss for user A key (no cross-user leakage)', async () => {
+      await saveIdempotentResponse('k4', HASH, 'v4', { secret: 'owner-a' }, OWNER_A)
+      const result = await getIdempotentResponse('k4', HASH, OWNER_B)
+      // B's namespace is empty → miss, not an error and not a data leak
       expect(result).toBeNull()
     })
 
-    it('error message does not disclose the original owner identity', async () => {
-      await saveIdempotentResponse('k6', HASH, 'v6', RESPONSE, OWNER_A)
-      const err = await getIdempotentResponse('k6', HASH, OWNER_B).catch((e) => e)
-      expect(err).toBeInstanceOf(IdempotencyOwnerMismatchError)
-      expect(err.message).not.toContain(OWNER_A.userId)
+    it('user B hash conflict is scoped to B namespace, not A', async () => {
+      await saveIdempotentResponse('k5', HASH, 'v5', RESPONSE, OWNER_A)
+      const altHash = hashRequestPayload({ amount: '999' })
+      // B stored a different payload under the same client key
+      await saveIdempotentResponse('k5', altHash, 'v5b', { other: true }, OWNER_B)
+
+      // A's entry is still intact and correctly replayed
+      const resultA = await getIdempotentResponse('k5', HASH, OWNER_A)
+      expect(resultA).toEqual(RESPONSE)
+
+      // B's entry is intact too
+      const resultB = await getIdempotentResponse('k5', altHash, OWNER_B)
+      expect(resultB).toEqual({ other: true })
     })
   })
 
-  // ── Cross-org key reuse ─────────────────────────────────────────────────────
+  // ── Cross-org isolation ─────────────────────────────────────────────────────
 
-  describe('cross-org key reuse rejection', () => {
-    it('throws IdempotencyOwnerMismatchError when same userId but different orgId', async () => {
-      await saveIdempotentResponse('k7', HASH, 'v7', RESPONSE, OWNER_A)
-      await expect(getIdempotentResponse('k7', HASH, OWNER_A_ORG2)).rejects.toThrow(
-        IdempotencyOwnerMismatchError,
-      )
+  describe('cross-org key isolation', () => {
+    it('different orgs using the same client key get independent cache entries', async () => {
+      await saveIdempotentResponse('org-key', HASH, 'va', { org: 1 }, OWNER_ORG1)
+      await saveIdempotentResponse('org-key', HASH, 'vb', { org: 2 }, OWNER_ORG2)
+
+      expect(await getIdempotentResponse('org-key', HASH, OWNER_ORG1)).toEqual({ org: 1 })
+      expect(await getIdempotentResponse('org-key', HASH, OWNER_ORG2)).toEqual({ org: 2 })
     })
 
-    it('allows replay when same userId and orgId (same org, same user)', async () => {
-      await saveIdempotentResponse('k8', HASH, 'v8', RESPONSE, OWNER_A)
-      const result = await getIdempotentResponse('k8', HASH, OWNER_A)
-      expect(result).toEqual(RESPONSE)
-    })
-
-    it('two users in different orgs can use the same client key string independently', async () => {
-      const sharedKeyString = 'client-chose-same-key'
-      // OWNER_A stores first
-      await saveIdempotentResponse(sharedKeyString, HASH, 'v-a', { owner: 'a' }, OWNER_A)
-      // OWNER_A_ORG2 tries to replay — the store is keyed by the raw string so they
-      // see OWNER_A's entry and get an owner mismatch (routes should namespace by user)
-      await expect(
-        getIdempotentResponse(sharedKeyString, HASH, OWNER_A_ORG2),
-      ).rejects.toThrow(IdempotencyOwnerMismatchError)
+    it('org-2 gets a cache miss for a key stored by org-1', async () => {
+      await saveIdempotentResponse('ok', HASH, 'v', RESPONSE, OWNER_ORG1)
+      expect(await getIdempotentResponse('ok', HASH, OWNER_ORG2)).toBeNull()
     })
   })
 
   // ── Anonymous / no-owner context ────────────────────────────────────────────
 
   describe('anonymous key handling', () => {
-    it('allows replay when no owner context passed at all (anonymous caller)', async () => {
-      await saveIdempotentResponse('k9', HASH, 'v9', RESPONSE)
-      const result = await getIdempotentResponse('k9', HASH)
-      expect(result).toEqual(RESPONSE)
+    it('stores and replays without owner context', async () => {
+      await saveIdempotentResponse('anon-key', HASH, 'v', RESPONSE)
+      expect(await getIdempotentResponse('anon-key', HASH)).toEqual(RESPONSE)
     })
 
-    it('allows replay by an authenticated caller of an anonymous-stored key', async () => {
-      await saveIdempotentResponse('k10', HASH, 'v10', RESPONSE, ANON)
-      const result = await getIdempotentResponse('k10', HASH, OWNER_A)
-      expect(result).toEqual(RESPONSE)
+    it('anonymous key is distinct from same-string key owned by a user', async () => {
+      await saveIdempotentResponse('k', HASH, 'va', { anon: true })
+      await saveIdempotentResponse('k', HASH, 'vb', { owned: true }, OWNER_A)
+
+      expect(await getIdempotentResponse('k', HASH)).toEqual({ anon: true })
+      expect(await getIdempotentResponse('k', HASH, OWNER_A)).toEqual({ owned: true })
     })
 
     it('still enforces hash check for anonymous keys', async () => {
-      await saveIdempotentResponse('k11', HASH, 'v11', RESPONSE)
-      await expect(getIdempotentResponse('k11', 'wrong-hash')).rejects.toThrow(
+      await saveIdempotentResponse('a', HASH, 'v', RESPONSE)
+      await expect(getIdempotentResponse('a', 'wrong-hash')).rejects.toThrow(
         IdempotencyConflictError,
       )
     })
   })
 
-  // ── Legacy keys without owner (backward compat) ─────────────────────────────
+  // ── Legacy / anonymous backward compat ──────────────────────────────────────
 
-  describe('legacy keys without owner', () => {
-    it('allows any authenticated user to replay a legacy key (null owner)', async () => {
-      // Simulate a key persisted before the owner-binding migration
-      await saveIdempotentResponse('legacy-key', HASH, 'v-legacy', RESPONSE, undefined)
-      const result = await getIdempotentResponse('legacy-key', HASH, OWNER_B)
-      expect(result).toEqual(RESPONSE)
-    })
-
-    it('treats null userId + null orgId as legacy (not owner-bound)', async () => {
-      await saveIdempotentResponse('legacy-key-2', HASH, 'v-legacy-2', RESPONSE, ANON)
-      const result = await getIdempotentResponse('legacy-key-2', HASH, OWNER_A)
-      expect(result).toEqual(RESPONSE)
+  describe('legacy keys without owner (backward compat)', () => {
+    it('keys saved without owner are isolated to the anonymous namespace', async () => {
+      await saveIdempotentResponse('legacy', HASH, 'v', { legacy: true }, undefined)
+      // Authenticated user does NOT pick up the anonymous-namespace entry
+      expect(await getIdempotentResponse('legacy', HASH, OWNER_A)).toBeNull()
+      // Anonymous caller does
+      expect(await getIdempotentResponse('legacy', HASH)).toEqual({ legacy: true })
     })
   })
 
-  // ── Store isolation between distinct owners ─────────────────────────────────
+  // ── resetIdempotencyStore ────────────────────────────────────────────────────
 
-  describe('store isolation', () => {
-    it('different keys for the same owner are independent', async () => {
-      await saveIdempotentResponse('key-x', HASH, 'vx', { x: 1 }, OWNER_A)
-      await saveIdempotentResponse('key-y', HASH, 'vy', { y: 2 }, OWNER_A)
-      expect(await getIdempotentResponse('key-x', HASH, OWNER_A)).toEqual({ x: 1 })
-      expect(await getIdempotentResponse('key-y', HASH, OWNER_A)).toEqual({ y: 2 })
+  describe('resetIdempotencyStore', () => {
+    it('clears all namespaced entries', async () => {
+      await saveIdempotentResponse('k', HASH, 'v', RESPONSE, OWNER_A)
+      resetIdempotencyStore()
+      expect(await getIdempotentResponse('k', HASH, OWNER_A)).toBeNull()
+    })
+  })
+
+  // ── failPendingIdempotentResponse ────────────────────────────────────────────
+
+  describe('failPendingIdempotentResponse', () => {
+    it('rejects the pending promise for the same owner', async () => {
+      const missPromise = getIdempotentResponse('pending-key', HASH, OWNER_A)
+      const pendingResult = await missPromise  // sets up the pending entry, returns null
+      expect(pendingResult).toBeNull()
+
+      // The pending entry is now stored under OWNER_A's namespace.
+      // Failing it should reject any waiter on that entry.
+      failPendingIdempotentResponse('pending-key', HASH, new Error('vault failed'), OWNER_A)
+      // No assertion needed beyond "does not throw" — the pending promise
+      // is now rejected and the entry removed from the map.
     })
 
-    it('resetIdempotencyStore clears all entries', async () => {
-      await saveIdempotentResponse('key-r', HASH, 'vr', RESPONSE, OWNER_A)
-      resetIdempotencyStore()
-      const result = await getIdempotentResponse('key-r', HASH, OWNER_A)
-      expect(result).toBeNull()
+    it('is a no-op when key is not pending', () => {
+      expect(() =>
+        failPendingIdempotentResponse('nonexistent', HASH, new Error('x'), OWNER_A),
+      ).not.toThrow()
+    })
+
+    it('is a no-op when hash does not match the pending entry', async () => {
+      await getIdempotentResponse('pending-hash-check', HASH, OWNER_A)
+      expect(() =>
+        failPendingIdempotentResponse('pending-hash-check', 'wrong-hash', new Error('x'), OWNER_A),
+      ).not.toThrow()
     })
   })
 })
 
 // ─── IdempotencyService (DB-backed) ──────────────────────────────────────────
 
-describe('IdempotencyService owner binding — DB layer', () => {
+describe('IdempotencyService — DB-backed owner binding', () => {
   // ── getStoredResponse ───────────────────────────────────────────────────────
 
   describe('getStoredResponse', () => {
@@ -197,95 +246,71 @@ describe('IdempotencyService owner binding — DB layer', () => {
       expect(await service.getStoredResponse('missing', OWNER_A)).toBeNull()
     })
 
-    it('returns response when owner matches (same userId and orgId)', async () => {
-      const { db } = makeMockDb({
-        response: JSON.stringify(RESPONSE),
-        request_hash: HASH,
-        user_id: 'user-alpha',
-        org_id: 'org-1',
-      })
+    it('looks up by namespaced key, not raw key', async () => {
+      const { db, mocks } = makeMockDb({ response: JSON.stringify(RESPONSE) })
+      const service = new IdempotencyService(db)
+      await service.getStoredResponse('my-key', OWNER_A)
+
+      expect(mocks.where).toHaveBeenCalledWith({ key: 'user:user-alpha:my-key' })
+    })
+
+    it('returns stored response when found', async () => {
+      const { db } = makeMockDb({ response: JSON.stringify(RESPONSE) })
       const service = new IdempotencyService(db)
       const result = await service.getStoredResponse('k', OWNER_A)
       expect(result).toEqual(JSON.stringify(RESPONSE))
     })
 
-    it('throws IdempotencyOwnerMismatchError when userId differs', async () => {
-      const { db } = makeMockDb({
-        response: JSON.stringify(RESPONSE),
-        request_hash: HASH,
-        user_id: 'user-alpha',
-        org_id: 'org-1',
-      })
+    it('different owners produce different DB lookup keys (no cross-user access)', async () => {
+      const { db, mocks } = makeMockDb(null)
       const service = new IdempotencyService(db)
-      await expect(service.getStoredResponse('k', OWNER_B)).rejects.toThrow(
-        IdempotencyOwnerMismatchError,
-      )
+
+      await service.getStoredResponse('k', OWNER_A)
+      await service.getStoredResponse('k', OWNER_B)
+
+      const calls = mocks.where.mock.calls
+      expect(calls[0][0]).toEqual({ key: 'user:user-alpha:k' })
+      expect(calls[1][0]).toEqual({ key: 'user:user-beta:k' })
     })
 
-    it('throws IdempotencyOwnerMismatchError when orgId differs', async () => {
-      const { db } = makeMockDb({
-        response: JSON.stringify(RESPONSE),
-        request_hash: HASH,
-        user_id: 'user-alpha',
-        org_id: 'org-1',
-      })
+    it('org-level key uses org namespace', async () => {
+      const { db, mocks } = makeMockDb(null)
       const service = new IdempotencyService(db)
-      await expect(service.getStoredResponse('k', OWNER_A_ORG2)).rejects.toThrow(
-        IdempotencyOwnerMismatchError,
-      )
+      await service.getStoredResponse('k', OWNER_ORG1)
+      expect(mocks.where).toHaveBeenCalledWith({ key: 'org:org-1:k' })
     })
 
-    it('allows replay of legacy DB record (null user_id and org_id) by any caller', async () => {
-      const { db } = makeMockDb({
-        response: JSON.stringify(RESPONSE),
-        request_hash: HASH,
-        user_id: null,
-        org_id: null,
-      })
+    it('returns response without owner when no owner provided', async () => {
+      const { db } = makeMockDb({ response: 'raw' })
       const service = new IdempotencyService(db)
-      const result = await service.getStoredResponse('legacy', OWNER_A)
-      expect(result).toEqual(JSON.stringify(RESPONSE))
-    })
-
-    it('returns response without owner check when no owner context provided', async () => {
-      const { db } = makeMockDb({
-        response: JSON.stringify(RESPONSE),
-        request_hash: HASH,
-        user_id: 'user-alpha',
-        org_id: 'org-1',
-      })
-      const service = new IdempotencyService(db)
-      const result = await service.getStoredResponse('k')
-      expect(result).toEqual(JSON.stringify(RESPONSE))
+      expect(await service.getStoredResponse('k')).toBe('raw')
     })
   })
 
   // ── storeResponse ───────────────────────────────────────────────────────────
 
   describe('storeResponse', () => {
-    it('inserts user_id and org_id from owner context', async () => {
+    it('inserts with namespaced key and owner audit columns', async () => {
       const { db, mocks } = makeMockDb(null)
       const service = new IdempotencyService(db)
-      await service.storeResponse('k', RESPONSE, OWNER_A)
+      await service.storeResponse('my-key', RESPONSE, OWNER_A)
 
       expect(mocks.insert).toHaveBeenCalledWith(
         expect.objectContaining({
+          key: 'user:user-alpha:my-key',
           user_id: 'user-alpha',
-          org_id: 'org-1',
+          org_id: null,
         }),
       )
     })
 
-    it('inserts null owner columns when no owner context provided', async () => {
+    it('inserts null audit columns when no owner provided', async () => {
       const { db, mocks } = makeMockDb(null)
       const service = new IdempotencyService(db)
       await service.storeResponse('k', RESPONSE)
 
       expect(mocks.insert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          user_id: null,
-          org_id: null,
-        }),
+        expect.objectContaining({ key: 'k', user_id: null, org_id: null }),
       )
     })
 
@@ -299,13 +324,23 @@ describe('IdempotencyService owner binding — DB layer', () => {
       )
     })
 
-    it('passes through string responses unchanged', async () => {
+    it('passes string responses through unchanged', async () => {
       const { db, mocks } = makeMockDb(null)
       const service = new IdempotencyService(db)
       await service.storeResponse('k', 'already-string', OWNER_A)
 
       expect(mocks.insert).toHaveBeenCalledWith(
         expect.objectContaining({ response: 'already-string' }),
+      )
+    })
+
+    it('org-level key uses org namespace in DB', async () => {
+      const { db, mocks } = makeMockDb(null)
+      const service = new IdempotencyService(db)
+      await service.storeResponse('k', RESPONSE, OWNER_ORG1)
+
+      expect(mocks.insert).toHaveBeenCalledWith(
+        expect.objectContaining({ key: 'org:org-1:k', org_id: 'org-1', user_id: null }),
       )
     })
   })
